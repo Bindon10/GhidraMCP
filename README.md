@@ -14,6 +14,49 @@ ghidraMCP is an Model Context Protocol server for allowing LLMs to autonomously 
 https://github.com/user-attachments/assets/36080514-f227-44bd-af84-78e29ee1d7f9
 
 
+# This fork
+
+Extended for Ghidra 12.1.2: 86 MCP tools against the original 27, each run against real
+binaries.
+
+## What it lets you do
+
+Ask your MCP client in plain language; the tool names are listed for reference.
+
+- **Find the code behind something you can see.** A console command, error message or config
+  key leads straight to the functions that use it (`find_string_xrefs`).
+- **Find a magic number.** Give a value like `90.0f` or `120` and get every place it is stored
+  or used as an immediate, each with its reference count, so live constants stand out from
+  coincidences (`search_constant`).
+- **Find who touches a struct field.** Every instruction that uses a given offset off a
+  register, such as `+0x700` (`find_field_accesses`).
+- **Ask where a value comes from, or where it goes.** The trace follows it through loads,
+  arithmetic and calls into other functions, and lists what it could not follow
+  (`trace_value`).
+- **Work out what a function is** when it has no strings of its own, from the imports, strings
+  and named callers around it (`function_evidence`).
+- **Recover C++ structure from a stripped binary.** Class names, vtables and inheritance from
+  MSVC RTTI, and the target slot of an indirect call like `call [rax+0x280]` (`find_rtti`,
+  `resolve_virtual_call`, `find_vtables_containing`).
+- **Build types quickly.** Paste a C header, or infer a struct from how a pointer is used
+  (`parse_c_header`, `auto_create_struct`).
+- **Keep your work across a game update.** Carry function names from an analysed build to a
+  new one by matching code shape (`match_functions`).
+- **Drive Ghidra without the GUI.** Import a binary, run analysis, save, and work with several
+  programs at once; undo changes step by step (`import_file`, `start_analysis`,
+  `undo`).
+- **Patch safely.** Get same-length patch bytes for a jump or call, then a Python script that
+  checks the file before writing, backs it up, verifies afterwards and can revert
+  (`inspect_instruction`, `generate_patch_script`).
+- **Follow along in Ghidra.** The model can move your listing to what it is talking about and
+  leave bookmarks you can browse later (`goto_address`, `set_bookmark`).
+- **Check the setup.** Confirm both halves are the same build, and run consistency checks
+  against the open program (`version`, `selftest`).
+
+The HTTP server binds to `127.0.0.1` by default. See [docs/SUMMARY.md](docs/SUMMARY.md) for an
+overview, [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for the tool reference and
+[docs/CHANGES.md](docs/CHANGES.md) for the full history.
+
 # Features
 MCP Server + Ghidra Plugin
 
@@ -29,12 +72,12 @@ MCP Server + Ghidra Plugin
 - MCP [SDK](https://github.com/modelcontextprotocol/python-sdk)
 
 ## Ghidra
-First, download the latest [release](https://github.com/LaurieWired/GhidraMCP/releases) from this repository. This contains the Ghidra plugin and Python MCP client. Then, you can directly import the plugin into Ghidra.
+First, build the extension (see [Building from Source](#building-from-source)) or download the `GhidraMCP-artifact` from this fork's latest [Actions](https://github.com/Bindon10/GhidraMCP/actions) build. It contains the Ghidra plugin and Python MCP client. Then, you can directly import the plugin into Ghidra.
 
 1. Run Ghidra
 2. Select `File` -> `Install Extensions`
 3. Click the `+` button
-4. Select the `GhidraMCP-1-2.zip` (or your chosen version) from the downloaded release
+4. Select the `GhidraMCP-1.0-SNAPSHOT.zip` from the build
 5. Restart Ghidra
 6. Make sure the GhidraMCPPlugin is enabled in `File` -> `Configure` -> `Developer`
 7. *Optional*: Configure the port in Ghidra with `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`
@@ -99,6 +142,8 @@ Another MCP client that supports multiple models on the backend is [5ire](https:
 3. Command: `python /ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py`
 
 # Building from Source
+Requires JDK 21 and Ghidra 12.1.2.
+
 1. Copy the following files from your Ghidra directory to this project's `lib/` directory:
 - `Ghidra/Features/Base/lib/Base.jar`
 - `Ghidra/Features/Decompiler/lib/Decompiler.jar`
