@@ -11,7 +11,7 @@ a large one.
 
 ## Where it ended
 
-**86 endpoints** (build 4.6), in five rounds of work, all verified against real Chivalry binaries.
+**87 endpoints** (build 4.9), in six rounds of work, all verified against real Chivalry binaries.
 
 ## Things it can do now that it couldn't
 
@@ -28,6 +28,8 @@ a large one.
   across function calls, ending with a list of what it couldn't follow
 - Show a function's branch structure, and break down a single instruction with ready-made
   patch bytes
+- Spot and repair functions wrongly flagged as never returning, which silently cut their
+  callers' decompiles short
 - Read the constant arguments at every call site of a function, which recovers whole tables
   at once, like every field a property registrar declares
 - Gather transitive evidence about a function with no strings of its own — the imports it
@@ -74,8 +76,8 @@ set against the open program after each install.
 
 ## How it was verified
 
-Every endpoint was run against real binaries — not just compiled and shipped. **31 defects
-were found and fixed**, plus three in new code that only a live run exposed.
+Every endpoint was run against real binaries — not just compiled and shipped. **40 defects
+were found and fixed**, plus five in new code that only a live run exposed.
 
 The ones worth noting returned confidently wrong *numbers* rather than errors: a vtable
 slot index of 68 where the truth was 80, a second endpoint saying 16 for the same slot, and

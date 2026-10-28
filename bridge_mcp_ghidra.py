@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "requests>=2,<3",
-#     "mcp>=1.2.0,<2",
+#     "mcp>=1.30,<2",
 # ]
 # ///
 
@@ -21,11 +21,33 @@ DEFAULT_GHIDRA_SERVER = "http://127.0.0.1:8080/"
 DEFAULT_TIMEOUT = 60
 SLOW_TIMEOUT = 300
 
-BRIDGE_BUILD = "4.6"
+BRIDGE_BUILD = "4.9"
 
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("ghidra-mcp")
+
+# Hints let a client tell lookups from edits. Older mcp releases lack them; fall back to
+# plain tools there rather than failing to start.
+try:
+    import inspect
+    from mcp.types import ToolAnnotations
+    _HINTS = "annotations" in inspect.signature(FastMCP.tool).parameters
+except ImportError:
+    _HINTS = False
+
+if _HINTS:
+    _ANNOTATIONS = {
+        "read": ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+        "edit": ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+        "destructive": ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                       openWorldHint=False),
+    }
+
+
+def tool(kind: str = "read"):
+    """Register a tool. read: no changes. edit: undoable changes. destructive: not undoable."""
+    return mcp.tool(annotations=_ANNOTATIONS[kind]) if _HINTS else mcp.tool()
 
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
@@ -99,14 +121,14 @@ def safe_post(endpoint: str, data: dict | str, timeout: int = None,
     except Exception as e:
         return f"Request failed: {str(e)}"
 
-@mcp.tool()
+@tool()
 def list_methods(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List all function names in the program with pagination.
     """
     return "\n".join(safe_get("methods", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def list_classes(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List C++ classes in the program.
@@ -118,24 +140,25 @@ def list_classes(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     return "\n".join(safe_get("classes", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def decompile_function(name: str, program: str = None) -> str:
     """
     Decompile a specific function by name and return the decompiled C code.
     """
-    return safe_post("decompile", name, program=program)
+    return safe_post("decompile", name, timeout=SLOW_TIMEOUT, program=program)
 
-@mcp.tool()
+@tool("edit")
 def rename_function(old_name: str, new_name: str, program: str = None) -> str:
     """
-    Rename a function by its current name to a new user-defined name.
+    Rename a function by its current name to a new user-defined name. A qualified
+    new_name ("UObject::Tick") moves it into that namespace, creating it if needed.
 
     Reports old -> new and the address. If several functions share the name it refuses
     and lists them; use a qualified Class::name or rename_function_by_address.
     """
     return safe_post("renameFunction", {"oldName": old_name, "newName": new_name}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def rename_data(address: str, new_name: str, program: str = None) -> str:
     """
     Rename the label on defined data, reporting the old and new names.
@@ -145,42 +168,42 @@ def rename_data(address: str, new_name: str, program: str = None) -> str:
     """
     return safe_post("renameData", {"address": address, "newName": new_name}, program=program)
 
-@mcp.tool()
+@tool()
 def list_segments(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List all memory segments in the program with pagination.
     """
     return "\n".join(safe_get("segments", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def list_imports(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List imported symbols in the program with pagination.
     """
     return "\n".join(safe_get("imports", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def list_exports(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List exported functions/symbols with pagination.
     """
     return "\n".join(safe_get("exports", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def list_namespaces(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List all non-global namespaces in the program with pagination.
     """
     return "\n".join(safe_get("namespaces", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def list_data_items(offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     List defined data labels and their values with pagination.
     """
     return "\n".join(safe_get("data", {"offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def search_functions_by_name(query: str, offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     Search for functions whose name contains the given substring.
@@ -189,39 +212,40 @@ def search_functions_by_name(query: str, offset: int = 0, limit: int = 100, prog
         return ["Error: query string is required"]
     return "\n".join(safe_get("searchFunctions", {"query": query, "offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool("edit")
 def rename_variable(function_name: str, old_name: str, new_name: str, program: str = None) -> str:
     """
-    Rename a local variable within a function.
+    Rename a local variable within a function. Reports old -> new, or Ghidra's reason
+    when the rename is refused (for example a name that already exists).
     """
     return safe_post("renameVariable", {
         "functionName": function_name,
         "oldName": old_name,
         "newName": new_name
-    }, program=program)
+    }, timeout=SLOW_TIMEOUT, program=program)
 
-@mcp.tool()
+@tool()
 def get_function_by_address(address: str, program: str = None) -> str:
     """
     Get a function by its address.
     """
     return "\n".join(safe_get("get_function_by_address", {"address": address}, program=program))
 
-@mcp.tool()
+@tool()
 def get_current_address(program: str = None) -> str:
     """
     Get the address currently selected by the user.
     """
     return "\n".join(safe_get("get_current_address", program=program))
 
-@mcp.tool()
+@tool()
 def get_current_function(program: str = None) -> str:
     """
     Get the function currently selected by the user.
     """
     return "\n".join(safe_get("get_current_function", program=program))
 
-@mcp.tool()
+@tool()
 def list_functions(offset: int = 0, limit: int = 500, filter: str = None, program: str = None) -> str:
     """
     List functions as "address<TAB>name<TAB>size". Paginated - a real binary has tens
@@ -238,7 +262,7 @@ def list_functions(offset: int = 0, limit: int = 500, filter: str = None, progra
         params["filter"] = filter
     return "\n".join(safe_get("list_functions", params, program=program))
 
-@mcp.tool()
+@tool()
 def decompile_function_by_address(address: str, start_line: int = 1, max_lines: int = 0,
                                   program: str = None) -> str:
     """
@@ -250,42 +274,48 @@ def decompile_function_by_address(address: str, start_line: int = 1, max_lines: 
                                "max_lines": max_lines},
                               timeout=SLOW_TIMEOUT, program=program))
 
-@mcp.tool()
+@tool()
 def disassemble_function(address: str, program: str = None) -> str:
     """
     Get assembly code (address: instruction; comment) for a function.
     """
     return "\n".join(safe_get("disassemble_function", {"address": address}, program=program))
 
-@mcp.tool()
+@tool("edit")
 def set_decompiler_comment(address: str, comment: str, program: str = None) -> str:
     """
     Set a comment for a given address in the function pseudocode.
     """
     return safe_post("set_decompiler_comment", {"address": address, "comment": comment}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def set_disassembly_comment(address: str, comment: str, program: str = None) -> str:
     """
     Set a comment for a given address in the function disassembly.
     """
     return safe_post("set_disassembly_comment", {"address": address, "comment": comment}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def rename_function_by_address(function_address: str, new_name: str, program: str = None) -> str:
     """
-    Rename a function by its address.
+    Rename a function by its address. Reports old -> new.
+
+    A qualified name such as "UObject::Tick" moves the function into that namespace,
+    creating it if needed; template arguments may contain "::".
     """
     return safe_post("rename_function_by_address", {"function_address": function_address, "new_name": new_name}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def set_function_prototype(function_address: str, prototype: str, program: str = None) -> str:
     """
-    Set a function's prototype.
+    Set a function's prototype, e.g. "int __thiscall Tick(void *this, float dt)".
+
+    The name in the prototype is applied too, so it renames the function when it
+    differs (reported as "Renamed old -> new"). The function's plate comment is left alone.
     """
     return safe_post("set_function_prototype", {"function_address": function_address, "prototype": prototype}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def set_local_variable_type(function_address: str, variable_name: str, new_type: str, program: str = None) -> str:
     """
     Set a local variable's type.
@@ -295,9 +325,9 @@ def set_local_variable_type(function_address: str, variable_name: str, new_type:
     resize fine. On a refusal the message carries Ghidra's own reason and both sizes, so
     you can tell which case you are in.
     """
-    return safe_post("set_local_variable_type", {"function_address": function_address, "variable_name": variable_name, "new_type": new_type}, program=program)
+    return safe_post("set_local_variable_type", {"function_address": function_address, "variable_name": variable_name, "new_type": new_type}, timeout=SLOW_TIMEOUT, program=program)
 
-@mcp.tool()
+@tool()
 def get_xrefs_to(address: str, offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     Get all references to the specified address (xref to).
@@ -312,7 +342,7 @@ def get_xrefs_to(address: str, offset: int = 0, limit: int = 100, program: str =
     """
     return "\n".join(safe_get("xrefs_to", {"address": address, "offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def get_xrefs_from(address: str, offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     Get all references from the specified address (xref from).
@@ -327,7 +357,7 @@ def get_xrefs_from(address: str, offset: int = 0, limit: int = 100, program: str
     """
     return "\n".join(safe_get("xrefs_from", {"address": address, "offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def get_function_xrefs(name: str, offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     Get all references to the specified function by name.
@@ -342,7 +372,7 @@ def get_function_xrefs(name: str, offset: int = 0, limit: int = 100, program: st
     """
     return "\n".join(safe_get("function_xrefs", {"name": name, "offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def list_strings(offset: int = 0, limit: int = 2000, filter: str = None, program: str = None) -> str:
     """
     List all defined strings in the program with their addresses.
@@ -365,7 +395,7 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None, program
 # Added tools
 # ======================================================================================
 
-@mcp.tool()
+@tool()
 def get_program_info(program: str = None) -> str:
     """
     Orientation for the currently open program: architecture, endianness, pointer size,
@@ -376,7 +406,7 @@ def get_program_info(program: str = None) -> str:
     """
     return "\n".join(safe_get("program_info", program=program))
 
-@mcp.tool()
+@tool()
 def get_function_context(address: str = None, name: str = None,
                          decompile: bool = True, disassemble: bool = False,
                          max_refs: int = 40, start_line: int = 1, max_lines: int = 0,
@@ -408,7 +438,7 @@ def get_function_context(address: str = None, name: str = None,
         params["name"] = name
     return "\n".join(safe_get("function_context", params, timeout=SLOW_TIMEOUT, program=program))
 
-@mcp.tool()
+@tool()
 def decompile_with_addresses(address: str, start_line: int = 1, max_lines: int = 0,
                              program: str = None) -> str:
     """
@@ -424,7 +454,7 @@ def decompile_with_addresses(address: str, start_line: int = 1, max_lines: int =
                                "max_lines": max_lines},
                               timeout=SLOW_TIMEOUT, program=program))
 
-@mcp.tool()
+@tool()
 def search_bytes(pattern: str, start: str = None, end: str = None, limit: int = 50, program: str = None) -> str:
     """
     Byte-pattern (AOB) search with wildcards. Returns address, memory block and
@@ -446,7 +476,7 @@ def search_bytes(pattern: str, start: str = None, end: str = None, limit: int = 
         params["end"] = end
     return "\n".join(safe_get("search_bytes", params, timeout=SLOW_TIMEOUT, program=program))
 
-@mcp.tool()
+@tool()
 def read_bytes(address: str, length: int = 64, program: str = None) -> str:
     """
     Hex dump of raw memory at an address (max 4096 bytes). Use when the listing view
@@ -454,7 +484,7 @@ def read_bytes(address: str, length: int = 64, program: str = None) -> str:
     """
     return "\n".join(safe_get("read_bytes", {"address": address, "length": length}, program=program))
 
-@mcp.tool()
+@tool()
 def disassemble_range(address: str, count: int = 40, program: str = None) -> str:
     """
     Disassemble N instructions starting at an address, whether or not a function is
@@ -463,21 +493,21 @@ def disassemble_range(address: str, count: int = 40, program: str = None) -> str
     """
     return "\n".join(safe_get("disassemble_range", {"address": address, "count": count}, program=program))
 
-@mcp.tool()
+@tool()
 def get_callers(address: str, offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     Functions that call the function at this address ("address<TAB>name").
     """
     return "\n".join(safe_get("get_callers", {"address": address, "offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def get_callees(address: str, offset: int = 0, limit: int = 100, program: str = None) -> str:
     """
     Functions called by the function at this address ("address<TAB>name").
     """
     return "\n".join(safe_get("get_callees", {"address": address, "offset": offset, "limit": limit}, program=program))
 
-@mcp.tool()
+@tool()
 def call_graph(address: str, depth: int = 2, direction: str = "callees",
                max_nodes: int = 200, program: str = None) -> str:
     """
@@ -496,7 +526,7 @@ def call_graph(address: str, depth: int = 2, direction: str = "callees",
                                    "direction": direction, "max_nodes": max_nodes},
                     timeout=SLOW_TIMEOUT, program=program))
 
-@mcp.tool()
+@tool()
 def list_symbols(filter: str = None, type: str = "any", offset: int = 0,
                  limit: int = 200, program: str = None) -> str:
     """
@@ -517,7 +547,7 @@ def list_symbols(filter: str = None, type: str = "any", offset: int = 0,
         params["filter"] = filter
     return "\n".join(safe_get("list_symbols", params, program=program))
 
-@mcp.tool()
+@tool()
 def list_data_types(filter: str = None, offset: int = 0, limit: int = 200, program: str = None) -> str:
     """
     List data types known to the program ("name<TAB>size<TAB>path"). Check here before
@@ -528,7 +558,7 @@ def list_data_types(filter: str = None, offset: int = 0, limit: int = 200, progr
         params["filter"] = filter
     return "\n".join(safe_get("list_data_types", params, program=program))
 
-@mcp.tool()
+@tool()
 def get_type_info(name: str, program: str = None) -> str:
     """
     Full layout of a struct or union: offset, size, type and name of every field.
@@ -537,7 +567,7 @@ def get_type_info(name: str, program: str = None) -> str:
     """
     return "\n".join(safe_get("get_type_info", {"name": name}, program=program))
 
-@mcp.tool()
+@tool()
 def get_vtable(address: str, count: int = 32, program: str = None) -> str:
     """
     Walk a pointer table and resolve each slot to a function
@@ -549,7 +579,7 @@ def get_vtable(address: str, count: int = 32, program: str = None) -> str:
     """
     return "\n".join(safe_get("get_vtable", {"address": address, "count": count}, program=program))
 
-@mcp.tool()
+@tool()
 def search_decompiled(query: str, name_filter: str = None, max_functions: int = 300,
                       limit: int = 50, program: str = None) -> str:
     """
@@ -570,7 +600,7 @@ def search_decompiled(query: str, name_filter: str = None, max_functions: int = 
         params["name_filter"] = name_filter
     return "\n".join(safe_get("search_decompiled", params, timeout=SLOW_TIMEOUT, program=program))
 
-@mcp.tool()
+@tool("edit")
 def create_struct(name: str, fields: str, packed: bool = False, program: str = None) -> str:
     """
     Create a named structure in the program's data type manager.
@@ -589,7 +619,7 @@ def create_struct(name: str, fields: str, packed: bool = False, program: str = N
     return safe_post("create_struct", {"name": name, "fields": fields,
                                        "packed": str(packed).lower()}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def apply_data_type(address: str, type_name: str, count: int = 1, program: str = None) -> str:
     """
     Define data of a named type at an address, clearing whatever was there.
@@ -598,7 +628,7 @@ def apply_data_type(address: str, type_name: str, count: int = 1, program: str =
     return safe_post("apply_data_type", {"address": address, "type_name": type_name,
                                          "count": count}, program=program)
 
-@mcp.tool()
+@tool("edit")
 def create_function(address: str, name: str = None, program: str = None) -> str:
     """
     Create a function at an address Ghidra left as loose code, optionally naming it.
@@ -613,7 +643,7 @@ def create_function(address: str, name: str = None, program: str = None) -> str:
         data["name"] = name
     return safe_post("create_function", data, timeout=SLOW_TIMEOUT, program=program)
 
-@mcp.tool()
+@tool("edit")
 def batch_rename(entries: str, kind: str = "function", program: str = None) -> str:
     """
     Rename many symbols in one request and one undo-able transaction.
@@ -624,14 +654,15 @@ def batch_rename(entries: str, kind: str = "function", program: str = None) -> s
         kind: "function" (default) or "label" for data/labels
 
     Strongly preferred over calling rename_function_by_address in a loop: one round trip
-    and one undo step instead of dozens.
+    and one undo step instead of dozens. Qualified function names ("Class::Method") put
+    the function in that namespace, creating it if needed.
     """
     return safe_post("batch_rename", {"kind": kind, "entries": entries},
                      timeout=SLOW_TIMEOUT, program=program)
 
 
 
-@mcp.tool()
+@tool()
 def list_annotations(filter: str = None, kind: str = "all",
                      offset: int = 0, limit: int = 200, program: str = None) -> str:
     """
@@ -656,7 +687,7 @@ def list_annotations(filter: str = None, kind: str = "all",
     return "\n".join(safe_get("list_annotations", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def get_comments(address: str = None, name: str = None, program: str = None) -> str:
     """
     Every comment attached to one function, in address order.
@@ -676,7 +707,7 @@ def get_comments(address: str = None, name: str = None, program: str = None) -> 
     return "\n".join(safe_get("get_comments", params, program=program))
 
 
-@mcp.tool()
+@tool("edit")
 def parse_c_header(source: str, args: str = None, program: str = None) -> str:
     """
     Parse a block of C declarations straight into the program's type manager.
@@ -702,7 +733,7 @@ def parse_c_header(source: str, args: str = None, program: str = None) -> str:
     return safe_post("parse_c_header", data, timeout=SLOW_TIMEOUT, program=program)
 
 
-@mcp.tool()
+@tool("edit")
 def create_enum(name: str, values: str, size: int = 4, category: str = None, program: str = None) -> str:
     """
     Create an enum data type.
@@ -725,7 +756,7 @@ def create_enum(name: str, values: str, size: int = 4, category: str = None, pro
     return safe_post("create_enum", data, program=program)
 
 
-@mcp.tool()
+@tool("edit")
 def set_equate(address: str, operand_index: int = 1, name: str = None,
                value: str = None, enum_name: str = None, program: str = None) -> str:
     """
@@ -749,7 +780,7 @@ def set_equate(address: str, operand_index: int = 1, name: str = None,
     return safe_post("set_equate", data, program=program)
 
 
-@mcp.tool()
+@tool("edit")
 def auto_create_struct(address: str = None, function: str = None,
                        variable: str = None, param_index: int = 0,
                        struct_name: str = None, apply: bool = True, program: str = None) -> str:
@@ -792,7 +823,7 @@ def auto_create_struct(address: str = None, function: str = None,
     return safe_post("auto_create_struct", data, timeout=SLOW_TIMEOUT, program=program)
 
 
-@mcp.tool()
+@tool()
 def find_field_accesses(offset: str, block: str = None, limit: int = 100,
                         max_instructions: int = 20000000, program: str = None) -> str:
     """
@@ -817,7 +848,7 @@ def find_field_accesses(offset: str, block: str = None, limit: int = 100,
     return "\n".join(safe_get("find_field_accesses", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def search_constant(value: str, kinds: str = "auto", block: str = None,
                     limit: int = 50, program: str = None) -> str:
     """
@@ -849,7 +880,7 @@ def search_constant(value: str, kinds: str = "auto", block: str = None,
     return "\n".join(safe_get("search_constant", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def search_instructions(regex: str, block: str = None, limit: int = 100,
                         max_instructions: int = 20000000, program: str = None) -> str:
     """
@@ -875,7 +906,7 @@ def search_instructions(regex: str, block: str = None, limit: int = 100,
     return "\n".join(safe_get("search_instructions", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def get_call_sites(address: str = None, name: str = None, with_args: bool = True,
                    limit: int = 50, program: str = None) -> str:
     """
@@ -904,7 +935,7 @@ def get_call_sites(address: str = None, name: str = None, with_args: bool = True
     return "\n".join(safe_get("get_call_sites", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def resolve_virtual_call(address: str, program: str = None) -> str:
     """
     Work out what an indirect call goes to.
@@ -921,7 +952,7 @@ def resolve_virtual_call(address: str, program: str = None) -> str:
                               timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def find_vtables_containing(address: str = None, name: str = None,
                             limit: int = 25, program: str = None) -> str:
     """
@@ -951,7 +982,7 @@ def find_vtables_containing(address: str = None, name: str = None,
     return "\n".join(safe_get("find_vtables_containing", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def file_offset(address: str = None, file_offset: str = None, program: str = None) -> str:
     """
     Convert between virtual address and file offset, both directions.
@@ -983,7 +1014,7 @@ def file_offset(address: str = None, file_offset: str = None, program: str = Non
 # prefixed with "# program: <name>" naming the binary that answered it.
 # ======================================================================================
 
-@mcp.tool()
+@tool()
 def list_open_programs() -> str:
     """
     List every program open in Ghidra, with the current one marked.
@@ -999,7 +1030,7 @@ def list_open_programs() -> str:
     return "\n".join(safe_get("list_open_programs"))
 
 
-@mcp.tool()
+@tool("edit")
 def select_program(name: str) -> str:
     """
     Change which program is current for calls that do not pass `program=`.
@@ -1010,7 +1041,7 @@ def select_program(name: str) -> str:
     return safe_post("select_program", {"name": name})
 
 
-@mcp.tool()
+@tool("edit")
 def import_file(path: str, folder: str = None, analyze: bool = False) -> str:
     """
     Import a binary into the open Ghidra project and open it in the tool.
@@ -1042,7 +1073,7 @@ def import_file(path: str, folder: str = None, analyze: bool = False) -> str:
     return safe_post("import_file", data, timeout=SLOW_TIMEOUT)
 
 
-@mcp.tool()
+@tool("edit")
 def start_analysis(name: str = None) -> str:
     """
     Run Ghidra's auto-analysis on a program, in the background.
@@ -1061,7 +1092,7 @@ def start_analysis(name: str = None) -> str:
     return safe_post("start_analysis", data, timeout=SLOW_TIMEOUT)
 
 
-@mcp.tool()
+@tool()
 def analysis_status(name: str = None) -> str:
     """
     Whether analysis is running, and how many functions exist so far.
@@ -1080,7 +1111,7 @@ def analysis_status(name: str = None) -> str:
     return "\n".join(safe_get("analysis_status", params))
 
 
-@mcp.tool()
+@tool("destructive")
 def save_program(program: str = None) -> str:
     """
     Write the program back to the Ghidra project.
@@ -1095,7 +1126,7 @@ def save_program(program: str = None) -> str:
 # Undo
 # ======================================================================================
 
-@mcp.tool()
+@tool()
 def list_undo_stack(limit: int = 30, program: str = None) -> str:
     """
     Show the program's undo and redo stacks, most recent first.
@@ -1107,7 +1138,7 @@ def list_undo_stack(limit: int = 30, program: str = None) -> str:
     return "\n".join(safe_get("list_undo_stack", {"limit": limit}, program=program))
 
 
-@mcp.tool()
+@tool("destructive")
 def undo(count: int = 1, program: str = None) -> str:
     """
     Undo the last N program transactions.
@@ -1123,7 +1154,7 @@ def undo(count: int = 1, program: str = None) -> str:
     return safe_post("undo", {"count": count}, program=program)
 
 
-@mcp.tool()
+@tool("destructive")
 def redo(count: int = 1, program: str = None) -> str:
     """
     Redo transactions previously undone.
@@ -1138,7 +1169,7 @@ def redo(count: int = 1, program: str = None) -> str:
 # Identification
 # ======================================================================================
 
-@mcp.tool()
+@tool()
 def find_string_xrefs(pattern: str, regex: bool = False, limit: int = 50,
                       max_refs: int = 10, program: str = None) -> str:
     """
@@ -1163,7 +1194,7 @@ def find_string_xrefs(pattern: str, regex: bool = False, limit: int = 50,
                               program=program))
 
 
-@mcp.tool()
+@tool()
 def function_evidence(address: str = None, name: str = None, depth: int = 2,
                       max_nodes: int = 400, program: str = None) -> str:
     """
@@ -1196,7 +1227,7 @@ def function_evidence(address: str = None, name: str = None, depth: int = 2,
                               program=program))
 
 
-@mcp.tool()
+@tool("edit")
 def suggest_names_from_strings(filter: str = None, limit: int = 100, min_length: int = 4,
                                apply: bool = False, program: str = None) -> str:
     """
@@ -1226,7 +1257,7 @@ def suggest_names_from_strings(filter: str = None, limit: int = 100, min_length:
                      program=program)
 
 
-@mcp.tool()
+@tool()
 def trace_value(address: str, variable: str = None, depth: int = 8,
                 direction: str = "backward", cross: int = 1, max_functions: int = 8,
                 program: str = None) -> str:
@@ -1259,7 +1290,7 @@ def trace_value(address: str, variable: str = None, depth: int = 8,
     return "\n".join(safe_get("trace_value", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool()
 def inspect_instruction(address: str, program: str = None) -> str:
     """
     Everything about one instruction: bytes, length, file offset, operands broken into
@@ -1273,7 +1304,7 @@ def inspect_instruction(address: str, program: str = None) -> str:
     return "\n".join(safe_get("inspect_instruction", {"address": address}, program=program))
 
 
-@mcp.tool()
+@tool()
 def get_basic_blocks(address: str = None, name: str = None, program: str = None) -> str:
     """
     Control-flow graph of a function: each basic block's range, instruction count, last
@@ -1291,7 +1322,7 @@ def get_basic_blocks(address: str = None, name: str = None, program: str = None)
     return "\n".join(safe_get("get_basic_blocks", params, timeout=SLOW_TIMEOUT, program=program))
 
 
-@mcp.tool()
+@tool("edit")
 def goto_address(address: str, program: str = None) -> str:
     """
     Move the user's Ghidra window (listing and decompiler) to an address.
@@ -1302,7 +1333,7 @@ def goto_address(address: str, program: str = None) -> str:
     return safe_post("goto_address", {"address": address}, program=program)
 
 
-@mcp.tool()
+@tool("edit")
 def set_bookmark(address: str, comment: str, category: str = "Claude",
                  program: str = None) -> str:
     """
@@ -1315,7 +1346,7 @@ def set_bookmark(address: str, comment: str, category: str = "Claude",
                                       "category": category}, program=program)
 
 
-@mcp.tool()
+@tool()
 def list_bookmarks(category: str = "Claude", filter: str = None, all: bool = False,
                    limit: int = 200, program: str = None) -> str:
     """
@@ -1331,14 +1362,36 @@ def list_bookmarks(category: str = "Claude", filter: str = None, all: bool = Fal
     return "\n".join(safe_get("list_bookmarks", params, program=program))
 
 
-@mcp.tool()
+@tool("edit")
 def remove_bookmark(address: str, category: str = "Claude", program: str = None) -> str:
     """Remove the note bookmark at an address in a category (default "Claude")."""
     return safe_post("remove_bookmark", {"address": address, "category": category},
                      program=program)
 
 
-@mcp.tool()
+@tool("edit")
+def fix_noreturn(apply: bool = False, limit: int = 100, program: str = None) -> str:
+    """
+    Find, and optionally repair, functions wrongly flagged as never returning.
+
+    Auto-analysis sometimes marks a function no-return although its body contains a real
+    return. Every call to it is then treated as the end of the caller: the code after the
+    call is never disassembled and decompiles silently stop there. Decompile output,
+    get_function_context and get_callees warn when a function is affected.
+
+    Lists functions flagged no-return whose body contains a return instruction, with how
+    many calls each has cut short. apply=true clears those flags, re-disassembles after
+    each affected call, refits the callers' bodies, and repeats for callers that inherited
+    the flag - all in one undo step. A return only counts when no call on the
+    straight-line path before it ends the process (TerminateProcess, ExitProcess, abort,
+    __fastfail ...), so handlers like __report_gsfailure, whose trailing RET is dead code,
+    are left alone.
+    """
+    return safe_post("fix_noreturn", {"apply": str(apply).lower(), "limit": limit},
+                     timeout=SLOW_TIMEOUT, program=program)
+
+
+@tool()
 def selftest(samples: int = 6, program: str = None) -> str:
     """
     Check the toolset against the open program: build match, name lookup, file-offset
@@ -1357,7 +1410,7 @@ def selftest(samples: int = 6, program: str = None) -> str:
 # Cross-binary and patching
 # ======================================================================================
 
-@mcp.tool()
+@tool("edit")
 def match_functions(from_program: str, to_program: str, min_instructions: int = 8,
                     apply: bool = False, limit: int = 500) -> str:
     """
@@ -1389,7 +1442,7 @@ def match_functions(from_program: str, to_program: str, min_instructions: int = 
     return safe_post("match_functions", data, timeout=SLOW_TIMEOUT)
 
 
-@mcp.tool()
+@tool()
 def generate_patch_script(edits: str, script_name: str = None, window: int = 12,
                           program: str = None) -> str:
     """
@@ -1422,7 +1475,7 @@ def generate_patch_script(edits: str, script_name: str = None, window: int = 12,
 
 
 
-@mcp.tool()
+@tool()
 def list_project_files(filter: str = None, limit: int = 200) -> str:
     """
     Every program in the open Ghidra project, whether or not it is currently open.
@@ -1443,7 +1496,7 @@ def list_project_files(filter: str = None, limit: int = 200) -> str:
     return "\n".join(safe_get("list_project_files", params))
 
 
-@mcp.tool()
+@tool("edit")
 def open_program(path: str, make_current: bool = False) -> str:
     """
     Open a program that is already in the project.
@@ -1464,7 +1517,7 @@ def open_program(path: str, make_current: bool = False) -> str:
                      timeout=SLOW_TIMEOUT)
 
 
-@mcp.tool()
+@tool("destructive")
 def close_program(name: str, save: bool = False) -> str:
     """
     Close an open program, so a session can put back what it opened.
@@ -1478,7 +1531,7 @@ def close_program(name: str, save: bool = False) -> str:
 
 
 
-@mcp.tool()
+@tool()
 def version() -> str:
     """
     Which build of each half is running.
@@ -1491,10 +1544,17 @@ def version() -> str:
     Reports the plugin build, the bridge build, the endpoint count, the Ghidra version and
     the current program, and says so explicitly when the two builds disagree.
     """
-    return "\n".join(safe_get("version", {"bridge": BRIDGE_BUILD}))
+    try:
+        from importlib.metadata import version as _pkg_version
+        sdk = _pkg_version("mcp")
+    except Exception:
+        sdk = "unknown"
+    hints = "on" if _HINTS else "off - update mcp to 1.30 or later"
+    return "\n".join(safe_get("version", {"bridge": BRIDGE_BUILD})
+                     + [f"mcp_sdk: {sdk} (tool hints {hints})"])
 
 
-@mcp.tool()
+@tool("edit")
 def find_rtti(filter: str = None, limit: int = 200, apply: bool = False,
               with_bases: bool = False, chunk_kb: int = 0, program: str = None) -> str:
     """
@@ -1531,7 +1591,7 @@ def find_rtti(filter: str = None, limit: int = 200, apply: bool = False,
     return safe_post("find_rtti", data, timeout=SLOW_TIMEOUT, program=program)
 
 
-@mcp.tool()
+@tool()
 def demangle(name: str, program: str = None) -> str:
     """
     Demangle a C++ symbol or an RTTI type-descriptor name.

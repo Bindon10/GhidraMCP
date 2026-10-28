@@ -111,6 +111,8 @@ public class GhidraMCPPlugin extends Plugin {
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final String LOCALHOST_OPTION_NAME = "Bind To Localhost Only";
+    private static final String DECOMPILE_TIMEOUT_OPTION_NAME = "Decompile Timeout Seconds";
+    private static final int DEFAULT_DECOMPILE_TIMEOUT = 45;
     private static final int DEFAULT_PORT = 8080;
 
     // Cached decompiler: creating a DecompInterface and re-opening the program on
@@ -134,6 +136,10 @@ public class GhidraMCPPlugin extends Plugin {
             "When enabled (default) the server binds to 127.0.0.1 only. The API can rename " +
             "functions, edit types and write comments with no authentication, so exposing it " +
             "on all interfaces lets anyone on the network modify your project.");
+        options.registerOption(DECOMPILE_TIMEOUT_OPTION_NAME, DEFAULT_DECOMPILE_TIMEOUT,
+            null,
+            "Longest a single decompile may run. Keep it under the MCP client's own limit "
+            + "(usually 60s) so a slow function reports a timeout rather than a dropped call.");
 
         try {
             startServer();
@@ -302,8 +308,7 @@ public class GhidraMCPPlugin extends Plugin {
             Map<String, String> params = parsePostParams(exchange);
             String functionAddress = params.get("function_address");
             String newName = params.get("new_name");
-            boolean success = renameFunctionByAddress(functionAddress, newName);
-            sendResponse(exchange, success ? "Function renamed successfully" : "Failed to rename function");
+            sendResponse(exchange, renameFunctionByAddress(functionAddress, newName));
         });
 
         ctx("/set_function_prototype", exchange -> {
@@ -360,13 +365,10 @@ public class GhidraMCPPlugin extends Plugin {
             }
 
             // Try to set the type
-            boolean success = setLocalVariableType(functionAddress, variableName, newType);
-
-            String successMsg = success ? "Variable type set successfully" : "Failed to set variable type";
-            responseMsg.append("\nResult: ").append(successMsg);
-            if (!success && lastVariableTypeError != null) {
-                responseMsg.append("\nReason: ").append(lastVariableTypeError);
-            }
+            String failure = setLocalVariableType(functionAddress, variableName, newType);
+            responseMsg.append("\nResult: ").append(failure == null
+                ? "Variable type set successfully" : "Failed to set variable type");
+            if (failure != null) responseMsg.append("\nReason: ").append(failure);
 
             sendResponse(exchange, responseMsg.toString());
         });
@@ -764,12 +766,18 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, getBasicBlocks(q.get("address"), q.get("name")));
         });
 
+        ctx("/fix_noreturn", exchange -> {
+            Map<String, String> p = parsePostParams(exchange);
+            sendResponse(exchange, fixNoReturn("true".equalsIgnoreCase(p.get("apply")),
+                parseIntOrDefault(p.get("limit"), 100)));
+        });
+
         ctx("/selftest", exchange -> {
             Map<String, String> q = parseQueryParams(exchange);
             sendResponse(exchange, selftest(q.get("bridge"), parseIntOrDefault(q.get("samples"), 6)));
         });
 
-        endpointCount = 86;
+        endpointCount = 87;
 
         // A small pool keeps one slow decompile from blocking every other request.
         // Decompiler access is serialized internally via decompLock. Waits on the UI
@@ -894,20 +902,16 @@ public class GhidraMCPPlugin extends Plugin {
         if (program == null) return "No program loaded";
 
         List<String> lines = new ArrayList<>();
-        for (MemoryBlock block : program.getMemory().getBlocks()) {
-            DataIterator it = program.getListing().getDefinedData(block.getStart(), true);
-            while (it.hasNext()) {
-                Data data = it.next();
-                if (block.contains(data.getAddress())) {
-                    String label   = data.getLabel() != null ? data.getLabel() : "(unnamed)";
-                    String valRepr = data.getDefaultValueRepresentation();
-                    lines.add(String.format("%s: %s = %s",
-                        data.getAddress(),
-                        escapeNonAscii(label),
-                        escapeNonAscii(valRepr)
-                    ));
-                }
-            }
+        DataIterator it = program.getListing().getDefinedData(true);
+        while (it.hasNext()) {
+            Data data = it.next();
+            String label   = data.getLabel() != null ? data.getLabel() : "(unnamed)";
+            String valRepr = data.getDefaultValueRepresentation();
+            lines.add(String.format("%s: %s = %s",
+                data.getAddress(),
+                escapeNonAscii(label),
+                escapeNonAscii(valRepr)
+            ));
         }
         return paginateList(lines, offset, limit);
     }
@@ -955,9 +959,9 @@ public class GhidraMCPPlugin extends Plugin {
         }
         DecompileResults result = decompileCached(program, matches.get(0), 60);
         if (result != null && result.decompileCompleted()) {
-            return result.getDecompiledFunction().getC();
+            return noReturnWarning(program, matches.get(0), true) + result.getDecompiledFunction().getC();
         }
-        return "Decompilation failed";
+        return decompileFailure(result, matches.get(0));
     }
 
     private String renameFunction(String oldName, String newName) {
@@ -967,8 +971,8 @@ public class GhidraMCPPlugin extends Plugin {
         Function f = uniqueFunctionNamed(program, oldName);
         if (f == null) return "Rename failed: no function named '" + oldName + "'";
         String err = inTransaction(program, "Rename function via HTTP",
-            () -> f.setName(newName, SourceType.USER_DEFINED));
-        return err == null ? "Renamed " + oldName + " -> " + newName + " @ " + f.getEntryPoint()
+            () -> setFunctionNameQualified(program, f, newName));
+        return err == null ? "Renamed " + oldName + " -> " + f.getName(true) + " @ " + f.getEntryPoint()
                            : "Rename failed: " + err;
     }
 
@@ -1014,7 +1018,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         DecompileResults result = decompileCached(program, func, 60);
         if (result == null || !result.decompileCompleted()) {
-            return "Decompilation failed";
+            return decompileFailure(result, func);
         }
 
         HighFunction highFunction = result.getHighFunction();
@@ -1049,37 +1053,24 @@ public class GhidraMCPPlugin extends Plugin {
 
         final HighSymbol finalHighSymbol = highSymbol;
         final Function finalFunction = func;
-        AtomicBoolean successFlag = new AtomicBoolean(false);
-
-        try {
-            invokeAndWaitBounded(() -> {           
-                int tx = program.startTransaction("Rename variable");
-                try {
-                    if (commitRequired) {
-                        HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
-                            ReturnCommitOption.NO_COMMIT, finalFunction.getSignatureSource());
-                    }
-                    HighFunctionDBUtil.updateDBVariable(
-                        finalHighSymbol,
-                        newVarName,
-                        null,
-                        SourceType.USER_DEFINED
-                    );
-                    successFlag.set(true);
+        final String[] reason = new String[1];
+        String err = inTransactionAborting(program, "Rename variable", () -> {
+            try {
+                if (commitRequired) {
+                    HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
+                        ReturnCommitOption.NO_COMMIT, finalFunction.getSignatureSource());
                 }
-                catch (Exception e) {
-                    Msg.error(this, "Failed to rename variable", e);
-                }
-                finally {
-                    successFlag.set(program.endTransaction(tx, true));
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            String errorMsg = "Failed to execute rename on Swing thread: " + e.getMessage();
-            Msg.error(this, errorMsg, e);
-            return errorMsg;
-        }
-        return successFlag.get() ? "Variable renamed" : "Failed to rename variable";
+                HighFunctionDBUtil.updateDBVariable(finalHighSymbol, newVarName, null,
+                    SourceType.USER_DEFINED);
+                return true;
+            } catch (Exception e) {
+                reason[0] = e.getClass().getSimpleName() + ": " + e.getMessage();
+                return false;
+            }
+        });
+        if (err != null) return "Failed to rename variable: " + err;
+        if (reason[0] != null) return "Failed to rename variable: " + reason[0];
+        return "Renamed " + oldVarName + " -> " + newVarName + " in " + func.getName();
     }
 
     /**
@@ -1235,8 +1226,8 @@ public class GhidraMCPPlugin extends Plugin {
             DecompileResults result = decompileCached(program, func, 60);
 
             return (result != null && result.decompileCompleted())
-                ? result.getDecompiledFunction().getC()
-                : "Decompilation failed";
+                ? noReturnWarning(program, func, true) + result.getDecompiledFunction().getC()
+                : decompileFailure(result, func);
         } catch (Exception e) {
             return "Error decompiling function: " + e.getMessage();
         }
@@ -1346,51 +1337,21 @@ public class GhidraMCPPlugin extends Plugin {
         }
     }
 
-    /**
-     * Rename a function by its address
-     */
-    private boolean renameFunctionByAddress(String functionAddrStr, String newName) {
+    /** Rename a function by its address. Returns a result line either way. */
+    private String renameFunctionByAddress(String functionAddrStr, String newName) {
         Program program = getCurrentProgram();
-        if (program == null) return false;
-        if (functionAddrStr == null || functionAddrStr.isEmpty() || 
-            newName == null || newName.isEmpty()) {
-            return false;
+        if (program == null) return "No program loaded";
+        if (functionAddrStr == null || functionAddrStr.isEmpty() || newName == null || newName.isEmpty()) {
+            return "Failed to rename function: function_address and new_name are required";
         }
-
-        AtomicBoolean success = new AtomicBoolean(false);
-
-        try {
-            invokeAndWaitBounded(() -> {
-                performFunctionRename(program, functionAddrStr, newName, success);
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute rename function on Swing thread", e);
-        }
-
-        return success.get();
-    }
-
-    /**
-     * Helper method to perform the actual function rename within a transaction
-     */
-    private void performFunctionRename(Program program, String functionAddrStr, String newName, AtomicBoolean success) {
-        int tx = program.startTransaction("Rename function by address");
-        try {
-            Address addr = program.getAddressFactory().getAddress(functionAddrStr);
-            Function func = getFunctionForAddress(program, addr);
-
-            if (func == null) {
-                Msg.error(this, "Could not find function at address: " + functionAddrStr);
-                return;
-            }
-
-            func.setName(newName, SourceType.USER_DEFINED);
-            success.set(true);
-        } catch (Exception e) {
-            Msg.error(this, "Error renaming function by address", e);
-        } finally {
-            program.endTransaction(tx, success.get());
-        }
+        Address addr = resolveAddress(program, functionAddrStr);
+        Function func = addr != null ? getFunctionForAddress(program, addr) : null;
+        if (func == null) return "Failed to rename function: no function at " + functionAddrStr;
+        String old = func.getName(true);
+        String err = inTransaction(program, "Rename function by address",
+            () -> setFunctionNameQualified(program, func, newName));
+        return err == null ? "Renamed " + old + " -> " + func.getName(true) + " @ " + func.getEntryPoint()
+                           : "Failed to rename function: " + err;
     }
 
     /**
@@ -1439,13 +1400,7 @@ public class GhidraMCPPlugin extends Plugin {
                 return;
             }
 
-            Msg.info(this, "Setting prototype for function " + func.getName() + ": " + prototype);
-
-            // Store original prototype as a comment for reference
-            addPrototypeComment(program, func, prototype);
-
-            // Use ApplyFunctionSignatureCmd to parse and apply the signature
-            parseFunctionSignatureAndApply(program, addr, prototype, success, errorMessage);
+            parseFunctionSignatureAndApply(program, func, prototype, success, errorMessage);
 
         } catch (Exception e) {
             String msg = "Error setting function prototype: " + e.getMessage();
@@ -1455,26 +1410,12 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Add a comment showing the prototype being set
-     */
-    private void addPrototypeComment(Program program, Function func, String prototype) {
-        int txComment = program.startTransaction("Add prototype comment");
-        try {
-            program.getListing().setComment(
-                func.getEntryPoint(), 
-                CodeUnit.PLATE_COMMENT, 
-                "Setting prototype: " + prototype
-            );
-        } finally {
-            program.endTransaction(txComment, true);
-        }
-    }
-
-    /**
      * Parse and apply the function signature with error handling
      */
-    private void parseFunctionSignatureAndApply(Program program, Address addr, String prototype,
+    private void parseFunctionSignatureAndApply(Program program, Function func, String prototype,
                                               AtomicBoolean success, StringBuilder errorMessage) {
+        Address addr = func.getEntryPoint();
+        String oldName = func.getName();
         // Use ApplyFunctionSignatureCmd to parse and apply the signature
         int txProto = program.startTransaction("Set function prototype");
         try {
@@ -1490,7 +1431,9 @@ public class GhidraMCPPlugin extends Plugin {
                 new ghidra.app.util.parser.FunctionSignatureParser(dtm, dtms);
 
             // Parse the prototype into a function signature
-            ghidra.program.model.data.FunctionDefinitionDataType sig = parser.parse(null, prototype);
+            // The current signature lets types it already uses resolve by name.
+            ghidra.program.model.data.FunctionDefinitionDataType sig =
+                parser.parse(func.getSignature(), prototype);
 
             if (sig == null) {
                 String msg = "Failed to parse function prototype";
@@ -1500,16 +1443,21 @@ public class GhidraMCPPlugin extends Plugin {
             }
 
             // Create and apply the command
-            ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd = 
+            // RENAME: the 3-argument form only renames FUN_ defaults and drops the name otherwise.
+            ghidra.app.cmd.function.ApplyFunctionSignatureCmd cmd =
                 new ghidra.app.cmd.function.ApplyFunctionSignatureCmd(
-                    addr, sig, SourceType.USER_DEFINED);
+                    addr, sig, SourceType.USER_DEFINED, false, false,
+                    DataTypeConflictHandler.DEFAULT_HANDLER,
+                    ghidra.app.cmd.function.FunctionRenameOption.RENAME);
 
             // Apply the command to the program
             boolean cmdResult = cmd.applyTo(program, new ConsoleTaskMonitor());
 
             if (cmdResult) {
                 success.set(true);
-                Msg.info(this, "Successfully applied function signature");
+                if (!oldName.equals(func.getName())) {
+                    errorMessage.append("Renamed ").append(oldName).append(" -> ").append(func.getName());
+                }
             } else {
                 String msg = "Command failed: " + cmd.getStatusMsg();
                 errorMessage.append(msg);
@@ -1524,91 +1472,37 @@ public class GhidraMCPPlugin extends Plugin {
         }
     }
 
-    /**
-     * Set a local variable's type using HighFunctionDBUtil.updateDBVariable
-     */
-    private boolean setLocalVariableType(String functionAddrStr, String variableName, String newType) {
-        // Input validation
+    /** Returns null on success, otherwise why not. Decompiles off Ghidra's UI thread. */
+    private String setLocalVariableType(String functionAddrStr, String variableName, String newType) {
         Program program = getCurrentProgram();
-        if (program == null) return false;
-        if (functionAddrStr == null || functionAddrStr.isEmpty() || 
-            variableName == null || variableName.isEmpty() ||
-            newType == null || newType.isEmpty()) {
-            return false;
+        if (program == null) return "No program loaded";
+        if (functionAddrStr == null || functionAddrStr.isEmpty() || variableName == null
+            || variableName.isEmpty() || newType == null || newType.isEmpty()) {
+            return "function_address, variable_name and new_type are required";
         }
-
-        AtomicBoolean success = new AtomicBoolean(false);
-
-        try {
-            invokeAndWaitBounded(() -> 
-                applyVariableType(program, functionAddrStr, variableName, newType, success));
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute set variable type on Swing thread", e);
+        Address addr = resolveAddress(program, functionAddrStr);
+        Function func = addr != null ? getFunctionForAddress(program, addr) : null;
+        if (func == null) return "No function at " + functionAddrStr;
+        DecompileResults results = decompileCached(program, func, 60);
+        if (results == null || !results.decompileCompleted() || results.getHighFunction() == null) {
+            return decompileFailure(results, func);
         }
-
-        return success.get();
-    }
-
-    /**
-     * Helper method that performs the actual variable type change
-     */
-    private void applyVariableType(Program program, String functionAddrStr, 
-                                  String variableName, String newType, AtomicBoolean success) {
-        try {
-            // Find the function
-            Address addr = program.getAddressFactory().getAddress(functionAddrStr);
-            Function func = getFunctionForAddress(program, addr);
-
-            if (func == null) {
-                Msg.error(this, "Could not find function at address: " + functionAddrStr);
-                return;
+        HighSymbol symbol = findSymbolByName(results.getHighFunction(), variableName);
+        if (symbol == null) return "No variable '" + variableName + "' in " + func.getName();
+        DataType dataType = resolveDataType(program.getDataTypeManager(), newType);
+        if (dataType == null) return "Could not resolve data type: " + newType;
+        final String[] reason = new String[1];
+        String err = inTransactionAborting(program, "Set variable type", () -> {
+            try {
+                HighFunctionDBUtil.updateDBVariable(symbol, symbol.getName(), dataType,
+                    SourceType.USER_DEFINED);
+                return true;
+            } catch (Exception e) {
+                reason[0] = describeRetypeFailure(e, symbol, dataType);
+                return false;
             }
-
-            DecompileResults results = decompileFunction(func, program);
-            if (results == null || !results.decompileCompleted()) {
-                return;
-            }
-
-            ghidra.program.model.pcode.HighFunction highFunction = results.getHighFunction();
-            if (highFunction == null) {
-                Msg.error(this, "No high function available");
-                return;
-            }
-
-            // Find the symbol by name
-            HighSymbol symbol = findSymbolByName(highFunction, variableName);
-            if (symbol == null) {
-                Msg.error(this, "Could not find variable '" + variableName + "' in decompiled function");
-                return;
-            }
-
-            // Get high variable
-            HighVariable highVar = symbol.getHighVariable();
-            if (highVar == null) {
-                Msg.error(this, "No HighVariable found for symbol: " + variableName);
-                return;
-            }
-
-            Msg.info(this, "Found high variable for: " + variableName + 
-                     " with current type " + highVar.getDataType().getName());
-
-            // Find the data type
-            DataTypeManager dtm = program.getDataTypeManager();
-            DataType dataType = resolveDataType(dtm, newType);
-
-            if (dataType == null) {
-                Msg.error(this, "Could not resolve data type: " + newType);
-                return;
-            }
-
-            Msg.info(this, "Using data type: " + dataType.getName() + " for variable " + variableName);
-
-            // Apply the type change in a transaction
-            updateVariableType(program, symbol, dataType, success);
-
-        } catch (Exception e) {
-            Msg.error(this, "Error setting variable type: " + e.getMessage());
-        }
+        });
+        return err != null ? err : reason[0];
     }
 
     /**
@@ -1625,58 +1519,18 @@ public class GhidraMCPPlugin extends Plugin {
         return null;
     }
 
-    /**
-     * Decompile a function and return the results
-     */
-    private DecompileResults decompileFunction(Function func, Program program) {
-        // Reuses the cached, already-opened decompiler instead of spinning up a new
-        // process and re-opening the program on every call.
-        DecompileResults results = decompileCached(program, func, 60);
-
-        if (results == null || !results.decompileCompleted()) {
-            Msg.error(this, "Could not decompile function: " +
-                (results == null ? "decompiler unavailable" : results.getErrorMessage()));
-            return null;
+    private String describeRetypeFailure(Exception e, HighSymbol symbol, DataType dataType) {
+        // The usual cause is a size mismatch, and the exception says so.
+        String msg = e.getClass().getSimpleName() + ": " + e.getMessage();
+        DataType current = symbol.getDataType();
+        if (current != null && current.getLength() != dataType.getLength()) {
+            msg += " (currently " + current.getName() + ", " + current.getLength() + " bytes; "
+                + dataType.getName() + " is " + dataType.getLength() + ". Ghidra only refuses a "
+                + "resize for variables in hash storage - ones the decompiler synthesised with no "
+                + "fixed register or stack location. A same-sized type, or naming the underlying "
+                + "variable instead, is the way through.)";
         }
-
-        return results;
-    }
-
-    /**
-     * Apply the type update in a transaction
-     */
-    private String lastVariableTypeError = null;
-
-    private void updateVariableType(Program program, HighSymbol symbol, DataType dataType, AtomicBoolean success) {
-        int tx = program.startTransaction("Set variable type");
-        lastVariableTypeError = null;
-        try {
-            HighFunctionDBUtil.updateDBVariable(
-                symbol,
-                symbol.getName(),
-                dataType,
-                SourceType.USER_DEFINED
-            );
-            success.set(true);
-        } catch (Exception e) {
-            // "Failed to set variable type" on its own sends the caller looking in the
-            // wrong place. The usual cause is a storage size mismatch - retyping an
-            // 8-byte register variable to a 4-byte int - and the exception says so.
-            lastVariableTypeError = e.getClass().getSimpleName() + ": " + e.getMessage();
-            DataType current = symbol.getDataType();
-            if (current != null && current.getLength() != dataType.getLength()) {
-                lastVariableTypeError += " (currently " + current.getName() + ", "
-                    + current.getLength() + " bytes; " + dataType.getName() + " is "
-                    + dataType.getLength() + ". Ghidra only refuses a resize for variables "
-                    + "in hash storage - ones the decompiler synthesised with no fixed "
-                    + "register or stack location. Register and stack variables resize "
-                    + "fine, so a same-sized type, or naming the underlying variable "
-                    + "instead, is the way through.)";
-            }
-            Msg.error(this, "Error setting variable type: " + e.getMessage());
-        } finally {
-            program.endTransaction(tx, success.get());
-        }
+        return msg;
     }
 
     /**
@@ -2098,10 +1952,13 @@ public class GhidraMCPPlugin extends Plugin {
      */
     private DecompInterface acquireDecompiler(Program program) {
         if (cachedDecomp != null && cachedDecompProgram == program) {
+            // Re-read each time so changes in Edit > Tool Options > Decompiler apply at once.
+            cachedDecomp.setOptions(DecompilerUtils.getDecompileOptions(tool, program));
             return cachedDecomp;
         }
         releaseDecompiler();
         DecompInterface decomp = new DecompInterface();
+        decomp.setOptions(DecompilerUtils.getDecompileOptions(tool, program));
         if (!decomp.openProgram(program)) {
             decomp.dispose();
             return null;
@@ -2123,6 +1980,24 @@ public class GhidraMCPPlugin extends Plugin {
         }
     }
 
+    private int decompileTimeoutSeconds() {
+        return tool.getOptions(OPTION_CATEGORY_NAME)
+            .getInt(DECOMPILE_TIMEOUT_OPTION_NAME, DEFAULT_DECOMPILE_TIMEOUT);
+    }
+
+    /** Why a decompile produced nothing, in terms the caller can act on. */
+    private String decompileFailure(DecompileResults r, Function f) {
+        String who = f != null ? " for " + f.getName() : "";
+        if (r == null) return "Decompilation failed" + who + ": the decompiler could not be started";
+        if (r.isTimedOut()) {
+            return "Decompilation timed out" + who + " after " + decompileTimeoutSeconds()
+                + "s - raise '" + DECOMPILE_TIMEOUT_OPTION_NAME + "' under Edit > Tool Options > "
+                + OPTION_CATEGORY_NAME;
+        }
+        String m = r.getErrorMessage();
+        return "Decompilation failed" + who + (m != null && !m.isBlank() ? ": " + m.trim() : "");
+    }
+
     /**
      * Decompile using the cached interface. Serialized: DecompInterface is not thread safe.
      */
@@ -2130,7 +2005,8 @@ public class GhidraMCPPlugin extends Plugin {
         synchronized (decompLock) {
             DecompInterface decomp = acquireDecompiler(program);
             if (decomp == null) return null;
-            return decomp.decompileFunction(func, timeoutSeconds, TaskMonitor.DUMMY);
+            int limit = Math.max(1, Math.min(timeoutSeconds, decompileTimeoutSeconds()));
+            return decomp.decompileFunction(func, limit, TaskMonitor.DUMMY);
         }
     }
 
@@ -2336,6 +2212,13 @@ public class GhidraMCPPlugin extends Plugin {
         sb.append("signature: ").append(func.getSignature().getPrototypeString()).append('\n');
         sb.append("calling_convention: ").append(func.getCallingConventionName()).append('\n');
         sb.append("thunk: ").append(func.isThunk()).append('\n');
+        if (func.hasNoReturn()) {
+            sb.append("noreturn: yes").append(isFalseNoReturn(program, func)
+                ? " - but the body contains a return, so the flag is probably wrong (fix_noreturn)" : "")
+              .append('\n');
+        }
+        String nrw = noReturnWarning(program, func, false);
+        if (!nrw.isEmpty()) sb.append(nrw);
         if (func.getSymbol() != null && func.getSymbol().getParentNamespace() != null) {
             sb.append("namespace: ").append(func.getSymbol().getParentNamespace().getName(true)).append('\n');
         }
@@ -2424,13 +2307,12 @@ public class GhidraMCPPlugin extends Plugin {
 
         DecompileResults result = decompileCached(program, func, 60);
         if (result == null || !result.decompileCompleted()) {
-            return "Decompilation failed" +
-                (result != null && result.getErrorMessage() != null ? ": " + result.getErrorMessage() : "");
+            return decompileFailure(result, func);
         }
 
         ClangTokenGroup markup = result.getCCodeMarkup();
         if (markup == null) {
-            return result.getDecompiledFunction().getC();
+            return noReturnWarning(program, func, true) + result.getDecompiledFunction().getC();
         }
 
         StringBuilder sb = new StringBuilder();
@@ -2450,9 +2332,9 @@ public class GhidraMCPPlugin extends Plugin {
                   .append('\n');
             }
         } catch (Exception e) {
-            return result.getDecompiledFunction().getC();
+            return noReturnWarning(program, func, true) + result.getDecompiledFunction().getC();
         }
-        return sb.toString();
+        return noReturnWarning(program, func, true) + sb.toString();
     }
 
     /**
@@ -2634,11 +2516,12 @@ public class GhidraMCPPlugin extends Plugin {
 
         List<String> lines = new ArrayList<>();
         for (Function f : func.getCalledFunctions(TaskMonitor.DUMMY)) {
-            lines.add(f.getEntryPoint() + "\t" + f.getName());
+            lines.add(f.getEntryPoint() + "\t" + f.getName()
+                + (isFalseNoReturn(program, f) ? "\t[flagged no-return but returns]" : ""));
         }
         Collections.sort(lines);
         if (lines.isEmpty()) return "No callees of " + func.getName();
-        return paginateList(lines, offset, limit);
+        return noReturnWarning(program, func, false) + paginateList(lines, offset, limit);
     }
 
     /**
@@ -3017,7 +2900,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         if (name != null && !name.isEmpty()) {
             String renameError = inTransaction(program, "GhidraMCP name new function",
-                () -> created.setName(name, SourceType.USER_DEFINED));
+                () -> setFunctionNameQualified(program, created, name));
             if (renameError != null) {
                 return "Created " + created.getName() + " at " + addr + " but rename failed: " + renameError;
             }
@@ -3062,9 +2945,9 @@ public class GhidraMCPPlugin extends Plugin {
                             results.add(pair[0] + "\tFAIL\tno function at address");
                             continue;
                         }
-                        String old = func.getName();
-                        func.setName(pair[1], SourceType.USER_DEFINED);
-                        results.add(pair[0] + "\tOK\t" + old + " -> " + pair[1]);
+                        String old = func.getName(true);
+                        setFunctionNameQualified(program, func, pair[1]);
+                        results.add(pair[0] + "\tOK\t" + old + " -> " + func.getName(true));
                     } else {
                         Symbol symbol = symbolTable.getPrimarySymbol(addr);
                         if (symbol == null) {
@@ -3447,7 +3330,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         DecompileResults results = decompileCached(program, func, 60);
         if (results == null || !results.decompileCompleted()) {
-            return "Decompilation failed for " + func.getName();
+            return decompileFailure(results, func);
         }
         HighFunction hf = results.getHighFunction();
         if (hf == null) return "Decompilation failed: no high function for " + func.getName();
@@ -3997,10 +3880,15 @@ public class GhidraMCPPlugin extends Plugin {
         if (limit <= 0) limit = 50;
 
         List<Reference> callRefs = new ArrayList<>();
-        ReferenceIterator ri = program.getReferenceManager().getReferencesTo(callee.getEntryPoint());
-        while (ri.hasNext()) {
-            Reference ref = ri.next();
-            if (ref.getReferenceType() != null && ref.getReferenceType().isCall()) callRefs.add(ref);
+        List<Address> targets = new ArrayList<>(List.of(callee.getEntryPoint()));
+        Address[] thunks = callee.getFunctionThunkAddresses(true);
+        if (thunks != null) targets.addAll(Arrays.asList(thunks));
+        for (Address target : targets) {
+            ReferenceIterator ri = program.getReferenceManager().getReferencesTo(target);
+            while (ri.hasNext()) {
+                Reference ref = ri.next();
+                if (ref.getReferenceType() != null && ref.getReferenceType().isCall()) callRefs.add(ref);
+            }
         }
         if (callRefs.isEmpty()) return "No call sites reference " + callee.getName();
 
@@ -4167,7 +4055,7 @@ public class GhidraMCPPlugin extends Plugin {
 
         DecompileResults dr = decompileCached(program, caller, 60);
         if (dr == null || !dr.decompileCompleted() || dr.getHighFunction() == null) {
-            return "Decompilation failed for " + caller.getName();
+            return decompileFailure(dr, caller);
         }
 
         PcodeOp callOp = null;
@@ -5231,7 +5119,7 @@ public class GhidraMCPPlugin extends Plugin {
         DecompileResults dr = decompileCached(program, func,
             outerDeadline != null ? Math.min(60, secondsLeft(outerDeadline)) : 60);
         if (dr == null || !dr.decompileCompleted() || dr.getHighFunction() == null) {
-            return "Decompilation failed for " + func.getName();
+            return decompileFailure(dr, func);
         }
         HighFunction hf = dr.getHighFunction();
 
@@ -6301,7 +6189,7 @@ public class GhidraMCPPlugin extends Plugin {
     // like a working one. One call should answer it.
     // ==================================================================================
 
-    private static final String BUILD_ID = "4.6";
+    private static final String BUILD_ID = "4.9";
 
     private String versionReport(String bridgeVersion) {
         StringBuilder sb = new StringBuilder();
@@ -6471,6 +6359,9 @@ public class GhidraMCPPlugin extends Plugin {
         ghidra.program.model.symbol.FlowType ft = ins.getFlowType();
         sb.append("flow: ").append(ft.getName());
         if (ins.getFallThrough() != null) sb.append("  fallthrough: ").append(ins.getFallThrough());
+        if (ins.getFlowOverride() != ghidra.program.model.listing.FlowOverride.NONE) {
+            sb.append("  flow_override: ").append(ins.getFlowOverride());
+        }
         sb.append('\n');
         Address[] flows = ins.getFlows();
         if (flows != null && flows.length > 0) {
@@ -6523,6 +6414,9 @@ public class GhidraMCPPlugin extends Plugin {
             sb.append("  never jump : ").append(nops).append('\n');
             sb.append("  always jump: 90 e9 ").append(rel).append('\n');
             sb.append("  invert     : 0f ").append(String.format("%02x", (b[1] & 0xFF) ^ 1)).append(' ').append(rel).append('\n');
+        } else if (!isCallMnemonic(ins) && (ins.getFlowType().isCall() || ins.getFlowType().isJump()
+                   || ins.getFlowType().isTerminal())) {
+            return null; // tail jumps and returns: no same-length edit is meaningful
         } else if (ins.getFlowType().isCall()) {
             sb.append("  remove call: ").append(nops)
               .append("  (the return register keeps whatever it held before)\n");
@@ -6606,8 +6500,276 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     // ==================================================================================
+    // No-return flags
+    //
+    // Auto-analysis sometimes marks a function no-return when it does return. Every call
+    // to it is then treated as the end of the caller: the code after it is never
+    // disassembled and the decompile silently stops there.
+    // ==================================================================================
+
+    /** Flagged no-return, yet its body contains a real return. Thunks are judged by their target. */
+    private boolean isFalseNoReturn(Program program, Function f) {
+        if (f == null) return false;
+        if (f.isThunk()) {
+            Function t = f.getThunkedFunction(true);
+            return f.hasNoReturn() && t != null && !t.isExternal() && isFalseNoReturn(program, t);
+        }
+        if (!f.hasNoReturn() || f.isExternal()) return false;
+        for (Instruction ins : program.getListing().getInstructions(f.getBody(), true)) {
+            ghidra.program.model.symbol.FlowType ft = ins.getFlowType();
+            if (ft.isJump() || ft.isCall()) continue;
+            for (PcodeOp op : ins.getPcode()) {
+                if (op.getOpcode() == PcodeOp.RETURN && !processEndsBefore(program, f, ins)) return true;
+            }
+        }
+        return false;
+    }
+
+    // Calls that never come back even though Ghidra may not flag them (TerminateProcess can
+    // target another process, so it is not marked no-return).
+    private static final Set<String> PROCESS_ENDERS = Set.of(
+        "TerminateProcess", "ExitProcess", "ExitThread", "FatalExit", "FatalAppExitA",
+        "FatalAppExitW", "RaiseFailFastException", "abort", "exit", "_exit", "_Exit",
+        "quick_exit", "__fastfail", "_invoke_watson", "__report_gsfailure",
+        "_CxxThrowException", "__std_terminate", "terminate");
+
+    /**
+     * True when the straight-line code leading to ret calls something that ends the
+     * process: the return after TerminateProcess(GetCurrentProcess()) is dead code.
+     */
+    private boolean processEndsBefore(Program program, Function f, Instruction ret) {
+        Listing listing = program.getListing();
+        Instruction cur = ret;
+        for (int steps = 0; steps < 64; steps++) {
+            if (program.getReferenceManager().hasReferencesTo(cur.getAddress())
+                && cur != ret && hasIncomingJump(program, cur.getAddress())) {
+                return false; // another path joins here
+            }
+            Instruction prev = listing.getInstructionBefore(cur.getAddress());
+            if (prev == null || !f.getBody().contains(prev.getAddress())) return false;
+            Address fall = prev.getFallThrough();
+            if (fall == null || !fall.equals(cur.getAddress())) return false;
+            if (prev.getFlowType().isCall() && callEndsProcess(program, prev)) return true;
+            cur = prev;
+        }
+        return false;
+    }
+
+    private boolean hasIncomingJump(Program program, Address a) {
+        ReferenceIterator it = program.getReferenceManager().getReferencesTo(a);
+        while (it.hasNext()) {
+            Reference r = it.next();
+            if (r.getReferenceType().isJump()) return true;
+        }
+        return false;
+    }
+
+    private boolean callEndsProcess(Program program, Instruction call) {
+        FunctionManager fm = program.getFunctionManager();
+        for (Address t : call.getFlows()) {
+            Function f = fm.getFunctionAt(t);
+            if (f != null && f.isThunk() && f.getThunkedFunction(true) != null) f = f.getThunkedFunction(true);
+            if (f != null && PROCESS_ENDERS.contains(f.getName())) return true;
+        }
+        // Calls through the import table reference the IAT slot, labelled with the import.
+        for (Reference r : call.getReferencesFrom()) {
+            String name = null;
+            if (r.isExternalReference()) {
+                name = ((ExternalReference) r).getLabel();
+            } else {
+                Symbol sym = program.getSymbolTable().getPrimarySymbol(r.getToAddress());
+                if (sym != null) name = sym.getName();
+            }
+            if (name == null) continue;
+            if (name.startsWith("__imp_")) name = name.substring(6);
+            if (PROCESS_ENDERS.contains(name)) return true;
+        }
+        return false;
+    }
+
+    /** Calls in f that end it because the callee is wrongly flagged no-return. */
+    private List<String> falseNoReturnCalls(Program program, Function f) {
+        List<String> out = new ArrayList<>();
+        FunctionManager fm = program.getFunctionManager();
+        for (Instruction ins : program.getListing().getInstructions(f.getBody(), true)) {
+            ghidra.program.model.symbol.FlowType ft = ins.getFlowType();
+            if (!ft.isCall() || !ft.isTerminal() || !isCallMnemonic(ins)) continue;
+            for (Address t : ins.getFlows()) {
+                Function callee = fm.getFunctionAt(t);
+                if (isFalseNoReturn(program, callee)) {
+                    out.add(callee.getName() + " at " + ins.getAddress());
+                }
+            }
+        }
+        return out;
+    }
+
+    /** A warning to put above output for f, or "" when nothing is wrong. */
+    private String noReturnWarning(Program program, Function f, boolean asCComment) {
+        List<String> calls = falseNoReturnCalls(program, f);
+        if (calls.isEmpty()) return "";
+        String text = "WARNING: code after these calls is missing - each callee is flagged no-return "
+            + "but contains a return: " + String.join(", ", calls) + ". Run fix_noreturn.";
+        return asCComment ? "/* " + text + " */\n" : "# " + text + "\n";
+    }
+
+    private String fixNoReturn(boolean apply, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (limit <= 0) limit = 100;
+        FunctionManager fm = program.getFunctionManager();
+        List<Function> suspects = new ArrayList<>();
+        for (Function f : fm.getFunctions(true)) {
+            if (f.hasNoReturn() && !f.isThunk() && isFalseNoReturn(program, f)) suspects.add(f);
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("# ").append(suspects.size())
+          .append(" function(s) flagged no-return that contain a return instruction\n");
+        if (suspects.isEmpty()) return sb.append("Nothing to fix.").toString();
+        sb.append("# function\taddress\tcalls treated as terminators\n");
+        int shown = 0;
+        for (Function f : suspects) {
+            if (shown++ >= limit) break;
+            sb.append(f.getName()).append('\t').append(f.getEntryPoint()).append('\t')
+              .append(terminatingCallSites(program, f).size()).append('\n');
+        }
+        if (suspects.size() > limit) sb.append("# ... ").append(suspects.size() - limit).append(" more\n");
+        if (!apply) {
+            return sb.append("\nNot applied. apply=true clears these flags, re-disassembles the code after ")
+                .append("each affected call and refits the callers' bodies, in one undoable step.").toString();
+        }
+
+        // Runs on this worker thread rather than Ghidra's UI thread: re-disassembly over many
+        // call sites can take longer than the UI-thread wait allows.
+        long deadline = System.currentTimeMillis() + 40_000;
+        int tx = program.startTransaction("Fix false no-return flags");
+        boolean ok = false;
+        Set<Address> cleared = new HashSet<>();
+        Set<Address> refit = new TreeSet<>();
+        Deque<Function> pending = new ArrayDeque<>();
+        int sites = 0;
+        boolean outOfTime = false;
+        try {
+            for (Function f : suspects) {
+                f.setNoReturn(false);
+                cleared.add(f.getEntryPoint());
+                pending.add(f);
+            }
+            while (!pending.isEmpty()) {
+                if (System.currentTimeMillis() > deadline) { outOfTime = true; break; }
+                Function target = pending.removeFirst();
+                for (Address s : terminatingCallSites(program, target)) {
+                    Instruction ins = program.getListing().getInstructionAt(s);
+                    if (ins == null) continue;
+                    Address next = ins.getMaxAddress().add(1);
+                    // Never disassemble into a function that already starts there.
+                    if (fm.getFunctionAt(next) != null || !program.getMemory().contains(next)) continue;
+                    Function owner = fm.getFunctionContaining(s);
+                    program.getListing().clearCodeUnits(ins.getMinAddress(), ins.getMaxAddress(), false);
+                    new ghidra.app.cmd.disassemble.DisassembleCommand(s, null, true)
+                        .applyTo(program, TaskMonitor.DUMMY);
+                    sites++;
+                    if (owner != null && !owner.isThunk()) {
+                        CreateFunctionCmd.fixupFunctionBody(program, owner, TaskMonitor.DUMMY);
+                        refit.add(owner.getEntryPoint());
+                        // A truncated caller may have inherited the flag; its return is visible now.
+                        if (owner.hasNoReturn() && isFalseNoReturn(program, owner)
+                            && cleared.add(owner.getEntryPoint())) {
+                            owner.setNoReturn(false);
+                            pending.add(owner);
+                        }
+                    }
+                }
+            }
+            ok = true;
+        } catch (Exception e) {
+            sb.append("\nFailed: ").append(e.getClass().getSimpleName()).append(": ").append(e.getMessage());
+        } finally {
+            program.endTransaction(tx, ok);
+        }
+        if (!ok) return sb.append("\nNothing was changed.").toString();
+        sb.append("\nApplied: cleared ").append(cleared.size()).append(" flag(s), re-disassembled ")
+          .append(sites).append(" call site(s), refit ").append(refit.size()).append(" caller(s).");
+        if (outOfTime) sb.append(" Stopped at the time budget - run again to continue.");
+        sb.append(" One undo step reverses it.");
+        return sb.toString();
+    }
+
+    // A thunk's tail JMP carries a call-return flow override; re-disassembling it would
+    // erase the override, so only genuine CALL instructions count as call sites here.
+    private static boolean isCallMnemonic(Instruction ins) {
+        return ins.getMnemonicString().toUpperCase().startsWith("CALL");
+    }
+
+    /** Call instructions to f (or its thunks) that Ghidra treats as ending the caller. */
+    private List<Address> terminatingCallSites(Program program, Function f) {
+        Set<Address> targets = new HashSet<>();
+        targets.add(f.getEntryPoint());
+        Address[] thunks = f.getFunctionThunkAddresses(true);
+        if (thunks != null) targets.addAll(Arrays.asList(thunks));
+        // Collect first: re-disassembly rewrites the reference table.
+        TreeSet<Address> sites = new TreeSet<>();
+        for (Address t : targets) {
+            ReferenceIterator it = program.getReferenceManager().getReferencesTo(t);
+            while (it.hasNext()) sites.add(it.next().getFromAddress());
+        }
+        List<Address> out = new ArrayList<>();
+        for (Address s : sites) {
+            Instruction ins = program.getListing().getInstructionAt(s);
+            if (ins == null || !isCallMnemonic(ins)) continue;
+            ghidra.program.model.symbol.FlowType ft = ins.getFlowType();
+            if (!ft.isCall() || !ft.isTerminal()) continue;
+            for (Address flow : ins.getFlows()) {
+                if (targets.contains(flow)) { out.add(s); break; }
+            }
+        }
+        return out;
+    }
+
+    // ==================================================================================
     // Function lookup by name
     // ==================================================================================
+
+    /**
+     * Split "A::B<C::D>::name" at top-level "::" only. Names quoted with ` or ' (compiler
+     * generated, such as dynamic initialisers) are never split.
+     */
+    static List<String> splitQualified(String name) {
+        List<String> parts = new ArrayList<>();
+        if (name.indexOf('`') >= 0 || name.indexOf('\'') >= 0) {
+            parts.add(name);
+            return parts;
+        }
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '<' || c == '(' || c == '[') depth++;
+            else if ((c == '>' || c == ')' || c == ']') && depth > 0) depth--;
+            else if (depth == 0 && c == ':' && i + 1 < name.length() && name.charAt(i + 1) == ':') {
+                parts.add(name.substring(start, i));
+                start = i + 2;
+                i++;
+            }
+        }
+        parts.add(name.substring(start));
+        parts.removeIf(String::isEmpty);
+        if (parts.isEmpty()) parts.add(name);
+        return parts;
+    }
+
+    /** Rename a function; a qualified name moves it into that namespace, creating it if needed. */
+    private void setFunctionNameQualified(Program program, Function f, String name) throws Exception {
+        List<String> parts = splitQualified(name.trim());
+        String simple = parts.get(parts.size() - 1);
+        if (parts.size() == 1) {
+            f.setName(simple, SourceType.USER_DEFINED);
+            return;
+        }
+        Namespace ns = ghidra.app.util.NamespaceUtils.createNamespaceHierarchy(
+            String.join("::", parts.subList(0, parts.size() - 1)), null, program, SourceType.USER_DEFINED);
+        f.getSymbol().setNameAndNamespace(simple, ns, SourceType.USER_DEFINED);
+    }
 
     private static class AmbiguousNameException extends RuntimeException {
         AmbiguousNameException(String m) { super(m); }
@@ -6630,7 +6792,19 @@ public class GhidraMCPPlugin extends Plugin {
         SymbolIterator it = program.getSymbolTable().getSymbols(simple);
         while (it.hasNext()) {
             Symbol s = it.next();
-            if (!(s.getObject() instanceof Function f)) continue;
+            Function f;
+            if (s.getObject() instanceof Function fn) {
+                f = fn;
+            } else if (s.getSymbolType() == SymbolType.LABEL && fm.getFunctionAt(s.getAddress()) != null) {
+                // Identical functions folded by the linker keep their other names as labels.
+                Function at = fm.getFunctionAt(s.getAddress());
+                if (qualified == null || s.getName(true).equals(qualified)) {
+                    if (!at.isExternal() && !out.contains(at)) out.add(at);
+                }
+                continue;
+            } else {
+                continue;
+            }
             // A thunk inherits its target's name without a symbol of its own, so the
             // symbol table only finds it through the target.
             Address[] thunks = f.getFunctionThunkAddresses(true);
@@ -6737,6 +6911,26 @@ public class GhidraMCPPlugin extends Plugin {
             DataType rb = findDataTypeByNameInAllCategories(dtm, twinB);
             check.accept(ra != null && rb != null && ra.getName().equals(twinA) && rb.getName().equals(twinB),
                 "type lookup keeps case: " + twinA + " / " + twinB);
+        }
+
+        // Qualified names split only at top-level "::".
+        check.accept(splitQualified("A::B<C::D>::f").equals(List.of("A", "B<C::D>", "f"))
+            && splitQualified("`dynamic_initializer_for_'X::Y''").size() == 1
+            && splitQualified("plain").equals(List.of("plain")),
+            "qualified-name splitting (templates and quoted names kept whole)");
+
+        // The decompiler runs with Ghidra's own Decompiler options, as the GUI does.
+        if (!pool.isEmpty()) {
+            decompileCached(program, pool.get(0), Math.min(30, secondsLeft(deadline)));
+            ghidra.app.decompiler.DecompileOptions used;
+            synchronized (decompLock) {
+                used = cachedDecomp != null ? cachedDecomp.getOptions() : null;
+            }
+            ghidra.app.decompiler.DecompileOptions want = DecompilerUtils.getDecompileOptions(tool, program);
+            check.accept(used != null && used.isRespectReadOnly() == want.isRespectReadOnly()
+                && used.isEliminateUnreachable() == want.isEliminateUnreachable(),
+                "decompiler uses Ghidra's Decompiler options (respect read-only: "
+                + (used != null && used.isRespectReadOnly()) + ")");
         }
 
         // RTTI scan gives the same answer whatever the piece size, so boundaries lose nothing.
@@ -7266,6 +7460,7 @@ public class GhidraMCPPlugin extends Plugin {
             return 404;
         }
         if (head.startsWith("Failed") || head.startsWith("Decompilation failed")
+            || head.startsWith("Decompilation timed out")
             || head.startsWith("Rename failed") || head.startsWith("Batch rename failed")) {
             return 500;
         }

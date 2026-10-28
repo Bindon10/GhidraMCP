@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/36080514-f227-44bd-af84-78e29ee1d7f9
 
 # This fork
 
-Extended for Ghidra 12.1.2: 86 MCP tools against the original 27, each run against real
+Extended for Ghidra 12.1.2: 87 MCP tools against the original 27, each run against real
 binaries.
 
 ## What it lets you do
@@ -35,6 +35,9 @@ Ask your MCP client in plain language; the tool names are listed for reference.
   (`trace_value`).
 - **Work out what a function is** when it has no strings of its own, from the imports, strings
   and named callers around it (`function_evidence`).
+- **Fix decompiles that stop mid-function.** When Ghidra wrongly decides a callee never
+  returns, every caller is cut short at that call; this finds and repairs those flags, and
+  decompiles warn when it has happened (`fix_noreturn`).
 - **Recover C++ structure from a stripped binary.** Class names, vtables and inheritance from
   MSVC RTTI, and the target slot of an indirect call like `call [rax+0x280]` (`find_rtti`,
   `resolve_virtual_call`, `find_vtables_containing`).
@@ -53,6 +56,8 @@ Ask your MCP client in plain language; the tool names are listed for reference.
 - **Check the setup.** Confirm both halves are the same build, and run consistency checks
   against the open program (`version`, `selftest`).
 
+Decompiled output uses Ghidra's own Decompiler settings, so it matches the decompiler window,
+and every tool is marked read-only, undoable edit or destructive for clients that use hints.
 The HTTP server binds to `127.0.0.1` by default. See [docs/SUMMARY.md](docs/SUMMARY.md) for an
 overview, [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for the tool reference and
 [docs/CHANGES.md](docs/CHANGES.md) for the full history.

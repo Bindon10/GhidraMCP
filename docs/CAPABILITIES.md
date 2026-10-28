@@ -1,6 +1,6 @@
 # GhidraMCP — capabilities and operating notes
 
-A customised build of GhidraMCP (4.6). 86 endpoints against stock's 30. Written for a session
+A customised build of GhidraMCP (4.9). 87 endpoints against stock's 30. Written for a session
 that has no memory of how it was built: what exists, what to reach for, and the things that
 cost real time to rediscover.
 
@@ -14,8 +14,9 @@ cost real time to rediscover.
 version
 ```
 
-Reports `plugin_build`, `bridge_build`, endpoint count, Ghidra version and current program,
-and prints **MISMATCH** when the two halves disagree. They are separate processes updated
+Reports `plugin_build`, `bridge_build`, endpoint count, Ghidra version, current program and
+the bridge's mcp SDK version with whether tool hints are on, and prints **MISMATCH** when the
+two halves disagree. They are separate processes updated
 separately, and a stale half behaves exactly like a working one.
 
 Do not infer the build from tool descriptions — the MCP client caches them and they lag the
@@ -83,6 +84,7 @@ session are invisible to everything else in the API.
 |---|---|
 | everything about one function | `get_function_context` |
 | what it is, when the body says nothing | `function_evidence` |
+| why the decompile stops mid-function | `fix_noreturn` |
 | where a value came from, or where it goes | `trace_value` |
 | its branch structure | `get_basic_blocks` |
 | one instruction in full | `inspect_instruction` |
@@ -107,6 +109,16 @@ reads the caller's disassembly back to where the register is set, stepping over 
 Offsets appear inline as `[0x700]`. **Always read the closing `# not followed:` list** —
 indirect calls, externals, memory writes, call sites past the cap. Those are open questions,
 not empty answers.
+
+**A warning above a decompile — "code after these calls is missing" — means a callee is
+wrongly flagged no-return** and Ghidra cut the caller short at that call. `fix_noreturn` lists
+such callees (dry run) and with `apply=true` repairs them in one undo step. It only counts a
+return that no process-ending call (TerminateProcess, abort, __fastfail …) precedes, and only
+re-disassembles genuine `CALL`s, never a thunk's or `Unwind@` funclet's tail `JMP`.
+
+The decompiler uses Ghidra's own Decompiler options (Edit → Tool Options → Decompiler), so
+output matches the decompiler window: read-only constants are folded (`FOV == 90.0`, not
+`__real@42b40000`).
 
 Large functions: pass `decompile=False` for the cheap summary, then page the body with
 `start_line` / `max_lines`. One 3,000-line function will otherwise fill the context.
@@ -184,7 +196,16 @@ save_program        renames and types live in memory until this is called
 ```
 
 Every write endpoint names its transaction, so the undo stack reads as a log. It includes
-GUI edits too, not just API ones — read it before undoing.
+GUI edits too, not just API ones — read it before undoing. Failed writes leave no entry.
+
+**Qualified names place functions in namespaces.** `rename_function`,
+`rename_function_by_address`, `batch_rename` and `create_function` treat `UObject::Tick` as
+namespace `UObject` plus name `Tick`, creating the namespace if needed; template arguments
+(`TArray<A::B>`) and quoted compiler names stay whole. `set_function_prototype` applies the
+name in the prototype too and reports the rename; it never touches the plate comment.
+
+Every tool carries a hint: read-only, edit (undoable) or destructive (`save_program`, which
+clears the undo history, plus `undo`, `redo`, `close_program`).
 
 `suggest_names_from_strings` mines assert and log strings for `Class::Method` identifiers
 and proposes names for the single unnamed function referencing each. It proposes by default;
@@ -246,7 +267,13 @@ blocks nothing. Any call that needs Ghidra's UI thread gives up after 40s with a
 naming a dialog as the likely cause rather than hanging.
 
 **The MCP client gives up at 60s** regardless of what the bridge allows, so `import_file`
-and `start_analysis` return immediately and report through `analysis_status`.
+and `start_analysis` return immediately and report through `analysis_status`. Decompiles are
+capped by the "Decompile Timeout Seconds" option (default 45, under Edit → Tool Options →
+GhidraMCP HTTP Server) and report a timeout as one.
+
+**The bridge needs mcp 1.30 or later from a fresh install** (`requirements.txt`); older pins
+fail to import against current pydantic. Releases too old for tool hints still run, without
+them.
 
 **`analyzed` vs function count.** `analysis_status` reads the live program;
 `list_project_files` reads disk. Between analysis finishing and `save_program` they
@@ -282,6 +309,15 @@ From Mirage's `TBLServer.exe` (SHA-256 `d315619393baff933fca7306749faecaa4320cb9
 |---|---|
 | `find_rtti` | 536 classes, COLs `0x145f623e0`–`0x145f75248`; matches an independent whole-file scan |
 | `selftest samples=1` | all pass, including the 16 MB / 4 KB `find_rtti` comparison |
+| decompile `FLockedViewState::FPlayerState::IsDefault` (`0x14366515f`) | `(this->ViewPoint).FOV == 90.0` |
+
+From a fresh, stripped `CMW.exe` import:
+
+| check | expected |
+|---|---|
+| `fix_noreturn` | nothing to fix; `__report_gsfailure` (dead RET after TerminateProcess) is not listed |
+| `get_call_sites 0x1400393e0` | 22,274 sites, 834 of them through `thunk_FUN_1400393e0` |
+| `inspect_instruction 0x140022ae0` | thunk `JMP`, `flow_override: CALL_RETURN`, no patch options |
 
 The `+0x15D` and `+0x139` offsets inside `GetMaxTickRate` hold across the MW client, the DW
 client and the DW dedicated server — three different binaries built from the same engine
@@ -313,8 +349,8 @@ source. Useful as a cross-build sanity check.
 
 ## 13. Working discipline
 
-The build history is instructive: 31 defects in the inherited and earlier code, plus three
-in the 4.2 additions that only a live run exposed, and the ones that mattered returned
+The build history is instructive: 40 defects in the inherited and earlier code, plus five
+in new code that only a live run exposed, and the ones that mattered returned
 *confidently wrong numbers* rather than errors — a slot index of 68 where the truth was 80,
 an analysis that reported success while doing nothing. None looked wrong.
 

@@ -2,7 +2,7 @@
 
 Built against Ghidra 12.1.2 (matches `extension.properties`). Baseline was stock
 LaurieWired GhidraMCP — 30 endpoints / 27 MCP tools. Round 1 took it to 45 endpoints /
-45 tools; round 2 to 58 / 58; round 3 to 73 / 73; 4.x to 86 / 86 (current build 4.6).
+45 tools; round 2 to 58 / 58; round 3 to 73 / 73; 4.x to 87 / 87 (current build 4.9).
 
 ## Install
 
@@ -1172,3 +1172,109 @@ it finished in the background was read-only.
   still ran after the skip. The whole-program constant search on the first sample (546k
   functions) took most of the budget, which is why only one sample fit. That is the expected
   trade-off, and it is reported rather than hidden.
+
+---
+
+# Round 4.7 – 4.9 — a second pass over REA and upstream GhidraMCP
+
+Sources: REA's Ghidra bridge (58 commits since the last review) and upstream GhidraMCP's 2.0
+rewrite plus its 78 open pull requests. Each finding was checked against this code before
+being acted on; the live tests below ran on Mirage's TBLServer.exe (with PDB) and a fresh,
+stripped CMW.exe import.
+
+87 endpoints / 87 tools (was 86).
+
+## Defects fixed
+
+**32. The decompiler was never configured** (upstream PR #56). No `DecompileOptions` were ever
+sent, so the native decompiler ran on bare defaults: read-only constants were not folded and
+the user's Decompiler settings were ignored. TBLServer's `FPlayerState::IsDefault` printed
+`__real@42b40000 == (this->ViewPoint).FOV`; it now prints `FOV == 90.0`, as Ghidra's own
+window does. Options come from `DecompilerUtils.getDecompileOptions`, the call the GUI uses,
+and are re-read on every request so changes apply at once.
+
+**33. Decompile failures were indistinguishable from dropped calls.** A 60 s decompile timeout
+matched the client's own 60 s limit. The timeout is now a tool option, "Decompile Timeout
+Seconds" (default 45), and a timeout is reported as one with the option to raise, not as
+"Decompilation failed".
+
+**34. `set_function_prototype` overwrote the plate comment** with "Setting prototype: …" on
+every call, in its own committed transaction, even when the prototype then failed to parse.
+Removed.
+
+**35. `set_function_prototype` dropped the name** in the prototype unless the function still
+had a `FUN_` name (upstream 24ff903): the 3-argument `ApplyFunctionSignatureCmd` passes
+`RENAME_IF_DEFAULT`. Now `RENAME`, reported as "Renamed old -> new".
+
+**36. `rename_variable` reported success on failure**: `endTransaction` in `finally` overwrote
+the failure flag and committed. It now commits only on success and returns Ghidra's reason.
+
+**37. `set_local_variable_type` decompiled on Ghidra's UI thread**, freezing the window for up
+to 60 s and able to apply after the caller had been told it failed. Decompiling now happens on
+the worker; only the commit runs on the UI thread. A shared error field that concurrent
+requests could overwrite is gone.
+
+**38. A fresh bridge install crashed on import** (upstream PR #176): `requirements.txt` pinned
+`mcp==1.5.0`, which fails against current pydantic. Now `mcp>=1.30,<2`.
+
+**39. Qualified new names became literal names.** `rename_function("UObject::Foo")` produced a
+global function literally named `UObject::Foo` — and `batch_rename`'s own example used that
+form. Function renames now split at top-level `::` (template arguments and quoted compiler
+names kept whole) and move the function into that namespace, creating it if needed.
+
+**40. Smaller ones.** Name lookup now also finds names Ghidra keeps as extra labels on a
+function's entry (identical functions folded by the linker). `get_call_sites` includes callers
+that reach the function through jump thunks. `list_data_items` reads data in one pass rather
+than once per memory block.
+
+## Added
+
+**`fix_noreturn`.** Auto-analysis sometimes marks a function no-return although it returns;
+every caller is then cut short at the call. Lists functions flagged no-return whose body has a
+reachable return, and with `apply=true` clears the flags, re-disassembles after each affected
+call, refits the callers and repeats for callers that inherited the flag — one undo step.
+Decompiles, `get_function_context` and `get_callees` warn when a function is affected.
+
+**Tool hints.** Every tool is marked read-only, edit (undoable) or destructive (`save_program`,
+`undo`, `redo`, `close_program`). Older mcp releases lack hints; the bridge then registers plain
+tools rather than failing, and `version` reports the SDK version and whether hints are on.
+
+**`inspect_instruction` shows flow overrides**, e.g. `flow_override: CALL_RETURN`.
+
+## Defects in the new code, found by running it
+
+**`__report_gsfailure` listed as a false no-return (4.7).** Its body ends with
+`TerminateProcess(GetCurrentProcess(), 0xC0000409)` and then a dead `RET`. "Contains a return"
+— REA's test too — said it returns; applying would have cleared a correct flag. 4.8: a return
+only counts when no call on the straight-line path before it ends the process (TerminateProcess,
+ExitProcess, abort, __fastfail …, including calls through the import table).
+
+**The repair erased thunk overrides (4.8).** A thunk's tail `JMP`, and every MSVC `Unwind@`
+funclet's, carries a `CALL_RETURN` flow override, so it looks like a call to a no-return
+function. 4.8 re-disassembled `thunk_FUN_14001e5d0` and would have done the same to 13 funclets,
+wiping the overrides. 4.9 repairs genuine `CALL` instructions only. The same confusion made
+`inspect_instruction` offer "remove call" bytes for a thunk's `JMP`; fixed, with a unit test.
+
+## Verified
+
+- `version` 4.9 / 4.9, `mcp_sdk: 1.28.1 (tool hints on)`; on mcp 1.6 the bridge starts with
+  hints off and all tools present; on 1.30 all 87 register (56 read, 27 edit, 4 destructive).
+- `selftest` on TBLServer: all pass, including the two new checks (decompiler uses Ghidra's
+  options with read-only respected; qualified-name splitting).
+- `IsDefault` decompiles to `FOV == 90.0`.
+- A prototype the parser rejects leaves no comment and no undo entry.
+- On `FUN_1402a43c0`: `MCPTest::Probe` created the namespace; a prototype with a new name
+  renamed it; a variable rename to `bad name` failed with Ghidra's reason and no undo entry;
+  the valid rename and retype worked; undo restored everything.
+- `get_call_sites FUN_1400393e0` on CMW: 22,274 sites, including 834 through its thunk.
+- No-return, CMW: dry run clean once `__report_gsfailure` was handled. A planted flag on
+  `FUN_14001e5d0` (Edit Function → No Return) made auto-analysis cut its callers short —
+  `FEngineLoop::PreInit`'s second call site fell outside any function. Warnings appeared in the
+  decompile and `get_function_context`. `apply=true` re-disassembled the 6 cut-short `CALL`s and
+  refit 5 callers; the call site rejoined `FEngineLoop::PreInit`, the destructor at
+  `1401ce790` decompiled whole again, and the thunk and `Unwind@` funclets kept `CALL_RETURN`.
+
+## Considered and left
+
+Upstream 2.0's headless mode, JSON output and test suite need the plugin split into separate
+layers. REA's switch-table recovery, analyzer control and PDB details remain candidates.
